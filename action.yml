@@ -1,0 +1,35 @@
+name: codelldbot
+description: codelldbot
+branding:
+  icon: aperture
+  color: green
+inputs:
+  issue_number:
+    type: number
+    required: true
+  token:
+    type: string
+runs:
+  using: "composite"
+  steps:
+    - name: Link requirements
+      run: ln -s ${{ github.action_path }}/requirements.txt action_requirements.txt
+      shell: bash      
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+        cache: 'pip'
+        cache-dependency-path: action_requirements.txt
+
+    - name: Install dependencies
+      run: pip -q install -r ${{ github.action_path }}/requirements.txt
+      shell: bash
+
+    - name: Analysis
+      env:
+        GITHUB_TOKEN: ${{ inputs.token || github.token }}
+        PYTHONUNBUFFERED: 1
+      run: python  ${{ github.action_path }}/codelldbot.py
+      shell: bash
