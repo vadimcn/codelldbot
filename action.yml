@@ -30,6 +30,7 @@ runs:
     - name: Analysis
       env:
         GITHUB_TOKEN: ${{ inputs.token || github.token }}
+        VERBOSE_LOGGING: ${{ runner.debug }}
         PYTHONUNBUFFERED: 1
       run: python  ${{ github.action_path }}/codelldbot.py
       shell: bash

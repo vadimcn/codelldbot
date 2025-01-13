@@ -5,7 +5,11 @@ import time
 
 import requests
 from openai import OpenAI
-from openai.types.beta.assistant_stream_event import ThreadMessageCompleted, ThreadRunRequiresAction
+from openai.types.beta.assistant_stream_event import (ThreadMessageCompleted,
+                                                      ThreadRunRequiresAction,
+                                                      ThreadRunStepCompleted)
+from openai.types.beta.threads.runs import (FileSearchToolCall,
+                                            ToolCallsStepDetails)
 
 
 class CodelldBot:
@@ -15,48 +19,55 @@ class CodelldBot:
         self.current_repository = os.getenv('GITHUB_REPOSITORY')
         self.search_repository = os.getenv('SEARCH_REPOSITORY') or self.current_repository
         self.modify = bool(self.token and os.getenv('MODIFY'))
+        self.verbose = bool(os.getenv('VERBOSE_LOGGING'))
+        self.found_issues = {}
 
     def handle_event(self):
 
         with open(os.getenv('GITHUB_EVENT_PATH'), 'rb') as f:
             event = json.load(f)
 
+        if self.verbose:
+            print('Event:', event)
+
         match os.getenv('GITHUB_EVENT_NAME'):
             case 'issues':
-                issue = event['issue']['number']
+                issue = event['issue']
             case 'workflow_dispatch':
                 issue_number = int(event['inputs']['issue_number'])
-                response = self.github_request(
-                    'GET', f'/repos/{self.current_repository}/issues/{issue_number}')
+                response = self.github_request('GET', f'/repos/{self.current_repository}/issues/{issue_number}')
                 if not response.ok:
                     raise Exception(f'''Could not fetch issue: {response['message']}''')
                 issue = response.json()
 
-        assistant = self.openai.beta.assistants.retrieve(
-            os.getenv('ASSISTANT_ID'))
+        if self.verbose:
+            print('Issue:', issue)
+
+        assistant = self.openai.beta.assistants.retrieve(os.getenv('ASSISTANT_ID'))
 
         issue_file = self.openai.files.create(
-            file=('BUG_REPORT.md', self.make_issue_content(
-                issue, show_labels=False)),
+            file=('BUG_REPORT.md', self.make_issue_content(issue, show_labels=False)),
             purpose='assistants'
         )
+
+        prompt = '\n'.join(['We have a new issue report (also attached as BUG_REPORT.md):',
+                            f''''Title: {issue['title']}''',
+                            issue['body']])
 
         thread = self.openai.beta.threads.create(
             metadata={
                 'issue': f'''{issue['number']}: {issue['title']}''',
-                'run_id': os.getenv('GITHUB_RUN_ID', '#'),
+                'run_id': os.getenv('GITHUB_RUN_ID', ''),
                 'model': f'{assistant.model} t={assistant.temperature} top_p={assistant.top_p}',
             },
             messages=[{
-                'role': 'user',
-                'content': 'We have a new issue report (attached as BUG_REPORT.md)',
+                'role': 'user', 'content': prompt,
                 'attachments': [{'file_id': issue_file.id, 'tools': [{'type': 'file_search'}]}]
             }]
         )
         print('Thread:', thread.id)
 
-        self.wait_vector_store(
-            thread.tool_resources.file_search.vector_store_ids[0])
+        self.wait_vector_store(thread.tool_resources.file_search.vector_store_ids[0])
 
         stream = self.openai.beta.threads.runs.create(
             assistant_id=assistant.id,
@@ -74,6 +85,13 @@ class CodelldBot:
                             print('<<Message>>', c.text.value)
                     case ThreadRunRequiresAction():
                         streams.append(self.handle_tool_calls(issue['number'], thread, event))
+                    case ThreadRunStepCompleted():
+                        if isinstance(event.data.step_details, ToolCallsStepDetails):
+                            for tool_call in event.data.step_details.tool_calls:
+                                if isinstance(tool_call, FileSearchToolCall):
+                                    print('<<File search>>')
+                                    for result in tool_call.file_search.results:
+                                        print(f'  {result.file_name}: {result.score}')
 
     def handle_tool_calls(self, issue_number: int, thread, event) -> object:
         def modify_repo(operation):
@@ -89,30 +107,36 @@ class CodelldBot:
             print(f'<<Tool call>>', tool.function.name, args)
             match tool.function.name:
                 case 'search_github':
-                    query = f'''repo:{self.search_repository} {args['query']}'''
+                    query = f'''repo:{self.search_repository} ({') OR ('.join(args['search_terms'])})'''
                     thread_vstore_id = thread.tool_resources.file_search.vector_store_ids[0]
-                    output = self.search_github(
-                        query, thread_vstore_id, exclude=[issue_number])
-                    tool_outputs.append(
-                        {'tool_call_id': tool.id, 'output': output})
+                    results = self.search_github(query, thread_vstore_id, exclude=[issue_number])
+                    if results:
+                        result_lines = [f'Found {len(results)} results and attached as files to this thread:']
+                        for issue_number, title, file in results:
+                            print(f'  {issue_number}: {title}')
+                            result_lines.append(f'{file.filename} => {issue_number}: {title}')
+                        output = '\n'.join(result_lines)
+                    else:
+                        output = 'No results found.'
+                    tool_outputs.append({'tool_call_id': tool.id, 'output': output})
+
                 case 'add_issue_labels':
                     output = modify_repo(lambda: self.github_request(
                         'POST', f'/repos/{self.current_repository}/issues/{issue_number}/labels',
                         json={'labels': args['labels']}))
-                    tool_outputs.append(
-                        {'tool_call_id': tool.id, 'output': output})
+                    tool_outputs.append({'tool_call_id': tool.id, 'output': output})
+
                 case 'set_issue_title':
                     output = modify_repo(lambda: self.github_request(
                         'PATCH', f'/repos/{self.current_repository}/issues/{issue_number}/labels',
                         json={'title': args['title']}))
-                    tool_outputs.append(
-                        {'tool_call_id': tool.id, 'output': output})
+                    tool_outputs.append({'tool_call_id': tool.id, 'output': output})
+
                 case 'add_issue_comment':
                     output = modify_repo(lambda: self.github_request(
                         'POST', f'/repos/{self.current_repository}/issues/{issue_number}/comments',
                         json={'body': args['body']}))
-                    tool_outputs.append(
-                        {'tool_call_id': tool.id, 'output': output})
+                    tool_outputs.append({'tool_call_id': tool.id, 'output': output})
 
         return self.openai.beta.threads.runs.submit_tool_outputs(
             thread_id=thread.id,
@@ -120,39 +144,36 @@ class CodelldBot:
             tool_outputs=tool_outputs,
             stream=True)
 
-    def search_github(self, query: str, vstore_id: str, exclude: list = [], max_results=5) -> str:
+    def search_github(self, query: str, vstore_id: str, exclude: list = [], max_results=5) -> list:
         response = self.github_request('GET', '/search/issues', dict(q=query))
         if not response.ok:
-            return f'''Search failed: {response.json()['message']}'''
+            print(f'''Search failed: {response.json()['message']}''')
+            return []
 
         issues = response.json()['items']
-        total_results = len(issues)
-        result_lines = []
+        results = []
         for issue in issues:
             issue_number = issue['number']
             if issue_number in exclude:
-                total_results -= 1
                 continue
-            issue_file = self.openai.files.create(
-                file=(f'ISSUE_{issue_number}.md', self.make_issue_content(issue, fetch_comments=True)),
-                purpose='assistants'
-            )
-            self.openai.beta.vector_stores.files.create(
-                vector_store_id=vstore_id,
-                file_id=issue_file.id,
-            )
-            result_lines.append(
-                f'Issue number: {issue_number}, file name: {issue_file.filename}')
-            if len(result_lines) >= max_results:
+
+            if issue_number not in self.found_issues:  # Don't attach the same data twice
+                issue_file = self.openai.files.create(
+                    file=(f'ISSUE_{issue_number}.md', self.make_issue_content(issue, fetch_comments=True)),
+                    purpose='assistants'
+                )
+                self.openai.beta.vector_stores.files.create(
+                    vector_store_id=vstore_id,
+                    file_id=issue_file.id,
+                )
+                self.found_issues[issue_number] = issue_file.id
+
+            results.append((issue_number, issue['title'], issue_file))
+            if len(results) >= max_results:
                 break
 
         self.wait_vector_store(vstore_id)
-
-        if len(result_lines) > 0:
-            summary = f'Found {total_results} issues, of which top {len(result_lines)} were attached as files to this thread:'
-            return '\n'.join([summary] + result_lines)
-        else:
-            return 'Search produced no results.'
+        return results
 
     def make_issue_content(self, issue, fetch_comments=False, show_labels=True) -> bytes:
         f = io.StringIO()
