@@ -20,6 +20,8 @@ class CodelldBot:
         self.search_repository = os.getenv('SEARCH_REPOSITORY') or self.current_repository
         self.modify = bool(self.token and os.getenv('MODIFY'))
         self.verbose = bool(os.getenv('VERBOSE_LOGGING'))
+        self.assistant = self.openai.beta.assistants.retrieve(os.getenv('ASSISTANT_ID'))
+        self.system_prompt, *self.step_prompts = self.assistant.instructions.split('\n---\n')
         self.found_issues = {}
 
     def handle_event(self):
@@ -43,38 +45,38 @@ class CodelldBot:
         if self.verbose:
             print('Issue:', issue)
 
-        assistant = self.openai.beta.assistants.retrieve(os.getenv('ASSISTANT_ID'))
-
+        issue_content = self.make_issue_content(issue, show_labels=False)
         issue_file = self.openai.files.create(
-            file=('BUG_REPORT.md', self.make_issue_content(issue, show_labels=False)),
+            file=('NEW_ISSUE.md', issue_content),
             purpose='assistants'
         )
-
-        prompt = '\n'.join(['We have a new issue report (also attached as BUG_REPORT.md):',
-                            f''''Title: {issue['title']}''',
-                            issue['body']])
-
         thread = self.openai.beta.threads.create(
             metadata={
                 'issue': f'''{issue['number']}: {issue['title']}''',
                 'run_id': os.getenv('GITHUB_RUN_ID', ''),
-                'model': f'{assistant.model} t={assistant.temperature} top_p={assistant.top_p}',
+                'model': f'{self.assistant.model} t={self.assistant.temperature} top_p={self.assistant.top_p}',
             },
             messages=[{
-                'role': 'user', 'content': prompt,
+                'role': 'user',
+                'content': self.step_prompts[0].replace('<<Issue>>', issue_content.decode('utf-8')),
                 'attachments': [{'file_id': issue_file.id, 'tools': [{'type': 'file_search'}]}]
             }]
         )
         print('Thread:', thread.id)
-
         self.wait_vector_store(thread.tool_resources.file_search.vector_store_ids[0])
 
+        self.run_assistant(thread, issue)
+        for prompt in self.step_prompts[1:]:
+            self.openai.beta.threads.messages.create(thread.id, role='user', content=prompt)
+            self.run_assistant(thread, issue)
+
+    def run_assistant(self, thread, issue):
         stream = self.openai.beta.threads.runs.create(
-            assistant_id=assistant.id,
+            assistant_id=self.assistant.id,
             thread_id=thread.id,
+            instructions=self.system_prompt,
             stream=True
         )
-
         streams = [stream]
         while streams:
             stream = streams.pop(0)
