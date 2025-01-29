@@ -111,7 +111,7 @@ class CodelldBot:
                 case 'search_github':
                     query = f'''repo:{self.search_repository} ({') OR ('.join(args['search_terms'])})'''
                     thread_vstore_id = thread.tool_resources.file_search.vector_store_ids[0]
-                    results = self.search_github(query, thread_vstore_id, exclude=[issue_number])
+                    results = self.search_github(query, thread_vstore_id, curr_issue_number=issue_number)
                     if results:
                         result_lines = [f'Found {len(results)} results and attached as files to this thread:']
                         for issue_number, title, file in results:
@@ -146,7 +146,7 @@ class CodelldBot:
             tool_outputs=tool_outputs,
             stream=True)
 
-    def search_github(self, query: str, vstore_id: str, exclude: list = [], max_results=5) -> list:
+    def search_github(self, query: str, vstore_id: str, curr_issue_number=None, max_results=5) -> list:
         response = self.github_request('GET', '/search/issues', dict(q=query))
         if not response.ok:
             print(f'''Search failed: {response.json()['message']}''')
@@ -156,7 +156,7 @@ class CodelldBot:
         results = []
         for issue in issues:
             issue_number = issue['number']
-            if issue_number in exclude:
+            if curr_issue_number is not None and issue_number >= curr_issue_number:
                 continue
 
             if issue_number not in self.found_issues:  # Don't attach the same data twice
