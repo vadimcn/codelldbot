@@ -50,9 +50,10 @@ class CodelldBot:
             file=('NEW_ISSUE.md', issue_content),
             purpose='assistants'
         )
+        issue_descr = f'''{issue['number']}: {issue['title']}'''
         thread = self.openai.beta.threads.create(
             metadata={
-                'issue': f'''{issue['number']}: {issue['title']}''',
+                'issue': issue_descr,
                 'run_id': os.getenv('GITHUB_RUN_ID', ''),
                 'model': f'{self.assistant.model} t={self.assistant.temperature} top_p={self.assistant.top_p}',
             },
@@ -63,7 +64,15 @@ class CodelldBot:
             }]
         )
         print('Thread:', thread.id)
-        self.wait_vector_store(thread.tool_resources.file_search.vector_store_ids[0])
+        thread_vstore_id = thread.tool_resources.file_search.vector_store_ids[0]
+        self.openai.beta.vector_stores.update(
+            thread_vstore_id,
+            name=issue_descr,
+            metadata={
+                'thread_id': thread.id
+            }
+        )
+        self.wait_vector_store(thread_vstore_id)
 
         self.run_assistant(thread, issue)
         for prompt in self.step_prompts[1:]:
