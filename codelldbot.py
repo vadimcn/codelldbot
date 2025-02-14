@@ -2,6 +2,7 @@ import io
 import json
 import os
 import time
+from typing import Any
 
 import requests
 from openai import OpenAI
@@ -112,6 +113,7 @@ class CodelldBot:
                     return f'''Failed: {response.json()['message']}'''
             return 'Ok'
 
+        thread_vstore_id = thread.tool_resources.file_search.vector_store_ids[0]
         tool_outputs = []
         for tool in event.data.required_action.submit_tool_outputs.tool_calls:
             args = json.loads(tool.function.arguments)
@@ -119,7 +121,6 @@ class CodelldBot:
             match tool.function.name:
                 case 'search_github':
                     query = f'''repo:{self.search_repository} ({') OR ('.join(args['search_terms'])})'''
-                    thread_vstore_id = thread.tool_resources.file_search.vector_store_ids[0]
                     results = self.search_github(query, thread_vstore_id, curr_issue_number=issue_number)
                     if results:
                         result_lines = [f'Found {len(results)} results and attached as files to this thread:']
@@ -129,6 +130,10 @@ class CodelldBot:
                         output = '\n'.join(result_lines)
                     else:
                         output = 'No results found.'
+                    tool_outputs.append({'tool_call_id': tool.id, 'output': output})
+
+                case 'get_external_content':
+                    output = self.get_external_content(args['url'], args['description'], thread_vstore_id)
                     tool_outputs.append({'tool_call_id': tool.id, 'output': output})
 
                 case 'add_issue_labels':
@@ -148,6 +153,9 @@ class CodelldBot:
                         'POST', f'/repos/{self.current_repository}/issues/{issue_number}/comments',
                         json={'body': args['body']}))
                     tool_outputs.append({'tool_call_id': tool.id, 'output': output})
+
+                case _:
+                    raise ValueError('Unknown tool call')
 
         return self.openai.beta.threads.runs.submit_tool_outputs(
             thread_id=thread.id,
@@ -169,14 +177,8 @@ class CodelldBot:
                 continue
 
             if issue_number not in self.found_issues:  # Don't attach the same data twice
-                issue_file = self.openai.files.create(
-                    file=(f'ISSUE_{issue_number}.md', self.make_issue_content(issue, fetch_comments=True)),
-                    purpose='assistants'
-                )
-                self.openai.beta.vector_stores.files.create(
-                    vector_store_id=vstore_id,
-                    file_id=issue_file.id,
-                )
+                issue_file = self.attach_file(vstore_id, f'ISSUE_{issue_number}.md',
+                                              self.make_issue_content(issue, fetch_comments=True))
                 self.found_issues[issue_number] = issue_file.id
 
             results.append((issue_number, issue['title'], issue_file))
@@ -185,6 +187,30 @@ class CodelldBot:
 
         self.wait_vector_store(vstore_id)
         return results
+
+    def get_external_content(self, url: str, description: str, vstore_id: str) -> str:
+        response = requests.get(url)
+        if response.ok:
+            content_type = response.headers['content-type'].lower().split(';')[0]
+            match content_type:
+                case 'text/plain' | 'text/x-log': ext = 'txt'
+                case 'text/html': ext = 'html'
+                case 'text/markdown': ext = 'md'
+                case 'image/png': ext = 'png'
+                case 'image/jpeg': ext = 'jpg'
+                case 'image/webp': ext = 'webp'
+                case _:
+                    return f'Failed: Unsupported content type ({content_type})'
+            name = f'{description}.{ext}'
+            self.attach_file(vstore_id, name, response.content)
+            return f'Attached as "{name}"'
+        else:
+            return f'Failed: {response.text}'
+
+    def attach_file(self, vstore_id: str, name: str, content: bytes) -> Any:
+        file = self.openai.files.create(file=(name, content), purpose='assistants')
+        self.openai.beta.vector_stores.files.create(vector_store_id=vstore_id, file_id=file.id)
+        return file
 
     def make_issue_content(self, issue, fetch_comments=False, show_labels=True) -> bytes:
         f = io.StringIO()
