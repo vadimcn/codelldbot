@@ -1,9 +1,16 @@
-from openai import OpenAI, NotFoundError
+from argparse import ArgumentParser
+
+from openai import NotFoundError, OpenAI
 
 openai = OpenAI()
 
+parser = ArgumentParser()
+parser.add_argument('--all', action='store_true')
+args = parser.parse_args()
+
 for vstore in openai.beta.vector_stores.list(order='asc', limit=100):
-    if vstore.status == 'expired':
+    thread_id = vstore.metadata.get('thread_id')
+    if thread_id and (vstore.status == 'expired' or args.all):
         print('Deleting', vstore.id)
         files = openai.beta.vector_stores.files.list(vstore.id, limit=100)
         while len(files.data) > 0:
@@ -17,7 +24,5 @@ for vstore in openai.beta.vector_stores.list(order='asc', limit=100):
 
         openai.beta.vector_stores.delete(vstore.id)
 
-        thread_id = vstore.metadata.get('thread_id')
-        if thread_id:
-            print('  Deleting', thread_id)
-            openai.beta.threads.delete(thread_id)
+        print('  Deleting', thread_id)
+        openai.beta.threads.delete(thread_id)
